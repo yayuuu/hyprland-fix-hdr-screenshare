@@ -6,9 +6,6 @@ commit_pins = [
     ["af923e30d1d24f1f4a4f5cb8308065173c1d9539", "db870de405f9deee8b778271745ca4674c852ae1"], # v0.55.0
 ]
 
-[hyprland]
-plugins = ["fix-hdr-screenshare"]
-
 [fix-hdr-screenshare]
 description = "Disable the HDR unmodified-copy MRT path used for screenshare"
 authors = ["daniel"]
