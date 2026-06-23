@@ -108,10 +108,6 @@ typedef void (*origPreDrawSurface)(void*, WP<CSurfacePassElement>, const CRegion
 typedef WP<CShader> (*origGetShaderVariant)(void*, Render::ePreparedFragmentShader, Render::ShaderFeatureFlags);
 typedef void (*origEnsureVRR)(void*, PHLMONITOR);
 
-static constexpr float CAPTURE_EXPOSURE_AT_REF_LUMINANCE = 0.78125F;
-static constexpr float CAPTURE_REFERENCE_LUMINANCE       = 80.0F;
-static constexpr float CAPTURE_SATURATION                = 0.86F;
-static constexpr float CAPTURE_DEFAULT_MIN_LUMINANCE      = 0.2F;
 static constexpr float HDR_ALPHA_CORRECTION_EXPONENT      = 1.5F;
 
 static void scheduleRefreshForAllMonitors() {
@@ -425,30 +421,16 @@ static bool ensureCaptureShader() {
 precision highp float;
 in vec2 v_texcoord;
 uniform sampler2D tex;
-uniform float exposure;
-uniform float saturation;
-uniform float blackLift;
+uniform float sdrMinLuminance;
+uniform float sdrMaxLuminance;
 uniform float inverseSdrBrightness;
 uniform float inverseSdrSaturation;
 uniform float contrast;
 uniform float brightness;
 layout(location = 0) out vec4 fragColor;
 
-vec3 acesApprox(vec3 v) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp((v * (a * v + b)) / (v * (c * v + d) + e), 0.0, 1.0);
-}
-
-vec3 linearToSrgb(vec3 v) {
-    bvec3 cutoff = lessThanEqual(v, vec3(0.0031308));
-    vec3  lower  = v * 12.92;
-    vec3  higher = 1.055 * pow(max(v, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
-    return mix(higher, lower, cutoff);
-}
+const float EXT_LINEAR_MIN_LUMINANCE = 0.0;
+const float EXT_LINEAR_MAX_LUMINANCE = 80.0;
 
 vec3 applySaturation(vec3 color, float saturation) {
     float y = dot(color, vec3(0.2126, 0.7152, 0.0722));
@@ -463,6 +445,13 @@ vec3 gain(vec3 src, float k) {
     return mix(a, 1.0 - a, t);
 }
 
+vec3 linearToSrgb(vec3 color) {
+    bvec3 cutoff = lessThanEqual(color, vec3(0.0031308));
+    vec3  lo     = color * 12.92;
+    vec3  hi     = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, cutoff);
+}
+
 void main() {
     vec4 src = texture(tex, v_texcoord);
     vec3 rgb = max(src.rgb, vec3(0.0));
@@ -470,16 +459,11 @@ void main() {
     rgb *= inverseSdrBrightness;
     rgb = applySaturation(rgb, inverseSdrSaturation);
 
-    rgb *= exposure;
-    rgb = acesApprox(rgb);
+    rgb = rgb * (EXT_LINEAR_MAX_LUMINANCE - EXT_LINEAR_MIN_LUMINANCE) + vec3(EXT_LINEAR_MIN_LUMINANCE);
 
-    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-    rgb        = mix(vec3(luma), rgb, saturation);
-
-    float shadowMask = 1.0 - smoothstep(0.0, 0.25, max(max(rgb.r, rgb.g), rgb.b));
-    rgb += vec3(blackLift) * shadowMask;
-
-    rgb = linearToSrgb(clamp(rgb, 0.0, 1.0));
+    float sdrRange = max(sdrMaxLuminance - sdrMinLuminance, 0.001);
+    rgb            = clamp((rgb - vec3(sdrMinLuminance)) / sdrRange, 0.0, 1.0);
+    rgb            = linearToSrgb(rgb);
 
     if (contrast != 1.0)
         rgb = gain(rgb, contrast);
@@ -498,7 +482,13 @@ void main() {
     return true;
 }
 
-static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<Render::IFramebuffer>& mirrorFB, const CBox& box, const float exposure, const float blackLift, const float inverseSdrBrightness, const float inverseSdrSaturation) {
+static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex,
+                                const SP<Render::IFramebuffer>& mirrorFB,
+                                const CBox& box,
+                                const float sdrMinLuminance,
+                                const float sdrMaxLuminance,
+                                const float inverseSdrBrightness,
+                                const float inverseSdrSaturation) {
     if (!g_pHyprRenderer || !Render::GL::g_pHyprOpenGL || !sourceTex || !mirrorFB || !ensureCaptureShader())
         return false;
 
@@ -520,9 +510,8 @@ static bool renderCaptureShader(const SP<Render::ITexture>& sourceTex, const SP<
     auto shader = Render::GL::g_pHyprOpenGL->useShader(g_captureShader);
     shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
     shader->setUniformInt(SHADER_TEX, 0);
-    glUniform1f(glGetUniformLocation(shader->program(), "exposure"), exposure);
-    glUniform1f(glGetUniformLocation(shader->program(), "saturation"), CAPTURE_SATURATION);
-    glUniform1f(glGetUniformLocation(shader->program(), "blackLift"), blackLift);
+    glUniform1f(glGetUniformLocation(shader->program(), "sdrMinLuminance"), sdrMinLuminance);
+    glUniform1f(glGetUniformLocation(shader->program(), "sdrMaxLuminance"), sdrMaxLuminance);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
     glUniform1f(glGetUniformLocation(shader->program(), "contrast"), 1.0F);
@@ -553,8 +542,8 @@ static bool renderCaptureShaderToFB(const SP<Render::ITexture>& sourceTex,
                                     const SP<Render::IFramebuffer>& targetFB,
                                     const Mat3x3& matrix,
                                     const CRegion& damage,
-                                    const float exposure,
-                                    const float blackLift,
+                                    const float sdrMinLuminance,
+                                    const float sdrMaxLuminance,
                                     const float inverseSdrBrightness,
                                     const float inverseSdrSaturation,
                                     const float contrast,
@@ -578,9 +567,8 @@ static bool renderCaptureShaderToFB(const SP<Render::ITexture>& sourceTex,
     auto shader = Render::GL::g_pHyprOpenGL->useShader(g_captureShader);
     shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, matrix.getMatrix());
     shader->setUniformInt(SHADER_TEX, 0);
-    glUniform1f(glGetUniformLocation(shader->program(), "exposure"), exposure);
-    glUniform1f(glGetUniformLocation(shader->program(), "saturation"), CAPTURE_SATURATION);
-    glUniform1f(glGetUniformLocation(shader->program(), "blackLift"), blackLift);
+    glUniform1f(glGetUniformLocation(shader->program(), "sdrMinLuminance"), sdrMinLuminance);
+    glUniform1f(glGetUniformLocation(shader->program(), "sdrMaxLuminance"), sdrMaxLuminance);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrBrightness"), inverseSdrBrightness);
     glUniform1f(glGetUniformLocation(shader->program(), "inverseSdrSaturation"), inverseSdrSaturation);
     glUniform1f(glGetUniformLocation(shader->program(), "contrast"), contrast);
@@ -644,8 +632,6 @@ static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebu
 
     const float sdrMaxLuminance = std::max<float>(1.0F, monitor->m_sdrMaxLuminance);
     const float sdrMinLuminance = std::max<float>(0.0F, monitor->m_sdrMinLuminance);
-    const float exposure             = CAPTURE_EXPOSURE_AT_REF_LUMINANCE * CAPTURE_REFERENCE_LUMINANCE / sdrMaxLuminance;
-    const float blackLift            = sdrMinLuminance / CAPTURE_REFERENCE_LUMINANCE;
     const float inverseSdrBrightness = monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
     const float inverseSdrSaturation = monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
 
@@ -653,8 +639,8 @@ static SP<Render::ITexture> renderSDRBlurFromHDRSource(const SP<Render::IFramebu
     Render::GL::g_pHyprOpenGL->blend(false);
     Render::GL::g_pHyprOpenGL->setCapStatus(GL_STENCIL_TEST, false);
 
-    if (!renderCaptureShaderToFB(source->getTexture(), blurSwapFB, glMatrix, damage, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation, *PBLURCONTRAST,
-                                 *PBLURBRIGHTNESS)) {
+    if (!renderCaptureShaderToFB(source->getTexture(), blurSwapFB, glMatrix, damage, sdrMinLuminance, sdrMaxLuminance, inverseSdrBrightness, inverseSdrSaturation,
+                                 *PBLURCONTRAST, *PBLURBRIGHTNESS)) {
         Render::GL::g_pHyprOpenGL->blend(blendWasEnabled);
         return nullptr;
     }
@@ -768,14 +754,12 @@ static void hkSaveBufferForMirror(void* thisptr, const CBox& box) {
     if (mirrorFB)
         mirrorFB->setImageDescription(captureImageDescription());
 
-    const float sdrMaxLuminance = monitor ? std::max<float>(1.0F, monitor->m_sdrMaxLuminance) : CAPTURE_REFERENCE_LUMINANCE;
-    const float sdrMinLuminance = monitor ? std::max<float>(0.0F, monitor->m_sdrMinLuminance) : CAPTURE_DEFAULT_MIN_LUMINANCE;
-    const float exposure             = CAPTURE_EXPOSURE_AT_REF_LUMINANCE * CAPTURE_REFERENCE_LUMINANCE / sdrMaxLuminance;
-    const float blackLift            = sdrMinLuminance / CAPTURE_REFERENCE_LUMINANCE;
+    const float sdrMaxLuminance = std::max<float>(1.0F, monitor->m_sdrMaxLuminance);
+    const float sdrMinLuminance = std::max<float>(0.0F, monitor->m_sdrMinLuminance);
     const float inverseSdrBrightness = monitor && monitor->m_sdrBrightness > 0.0F ? 1.0F / monitor->m_sdrBrightness : 1.0F;
     const float inverseSdrSaturation = monitor && monitor->m_sdrSaturation > 0.0F ? 1.0F / monitor->m_sdrSaturation : 1.0F;
 
-    if (renderCaptureShader(sourceTex, mirrorFB, box, exposure, blackLift, inverseSdrBrightness, inverseSdrSaturation))
+    if (renderCaptureShader(sourceTex, mirrorFB, box, sdrMinLuminance, sdrMaxLuminance, inverseSdrBrightness, inverseSdrSaturation))
         return;
 }
 
