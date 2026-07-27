@@ -24,11 +24,12 @@
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
-#include <hyprland/src/helpers/Monitor.hpp>
+#include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/render/Renderbuffer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 
 extern "C" {
 #include <xf86drm.h>
@@ -114,17 +115,20 @@ static void scheduleRefreshForAllMonitors() {
     if (!g_pCompositor)
         return;
 
-    for (const auto& monitor : g_pCompositor->m_monitors) {
+    if (!State::monitorState())
+        return;
+
+    for (const auto& monitor : State::monitorState()->monitors()) {
         if (!monitor)
             continue;
 
         monitor->m_forceFullFrames = std::max(monitor->m_forceFullFrames, 1);
-        g_pCompositor->scheduleFrameForMonitor(monitor, Aquamarine::IOutput::AQ_SCHEDULE_RENDER_MONITOR);
+        monitor->scheduleFrame(Aquamarine::IOutput::AQ_SCHEDULE_RENDER_MONITOR);
     }
 }
 
 static bool hkNeedsUnmodifiedCopy(void* thisptr) {
-    const auto monitor = static_cast<CMonitor*>(thisptr);
+    const auto monitor = static_cast<Monitor::CMonitor*>(thisptr);
 
     if (g_disableUnmodifiedCopyMRT && monitor && monitor->inHDR())
         return false;
@@ -195,7 +199,10 @@ static void correctAllMonitorVrrCapabilityCaches() {
     if (!g_pCompositor)
         return;
 
-    for (const auto& monitor : g_pCompositor->m_monitors)
+    if (!State::monitorState())
+        return;
+
+    for (const auto& monitor : State::monitorState()->monitors())
         correctMonitorVrrCapabilityCache(monitor);
 }
 
